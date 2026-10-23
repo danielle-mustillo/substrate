@@ -4904,6 +4904,62 @@ func Validate_GoldenSnapshotStatus(
 		errs = append(errs, fn(fldPath.Child("error_message"), &obj.ErrorMessage, oldVal, oldObj != nil)...)
 	}
 
+	{ // field ateapipb.GoldenSnapshotStatus.Attempts
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *int32,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if obj == oldObj || (obj != nil && oldObj != nil && *obj == *oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalValue(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *ateapipb.GoldenSnapshotStatus) *int32 {
+				return &oldObj.Attempts
+			})
+		errs = append(errs, fn(fldPath.Child("attempts"), &obj.Attempts, oldVal, oldObj != nil)...)
+	}
+
+	{ // field ateapipb.GoldenSnapshotStatus.LastCrashTime
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *timestamppb.Timestamp,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if ateDeepEqual(obj, oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalPointer(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *ateapipb.GoldenSnapshotStatus) *timestamppb.Timestamp {
+				return oldObj.LastCrashTime
+			})
+		errs = append(errs, fn(fldPath.Child("last_crash_time"), obj.LastCrashTime, oldVal, oldObj != nil)...)
+	}
+
 	return errs
 }
 

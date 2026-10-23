@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"time"
 	"unicode/utf8"
@@ -54,6 +55,14 @@ const (
 	reasonUnexpectedState            = "GoldenActorUnexpectedState"
 )
 
+// goldenRetryBackoff is the wait after the golden actor's crash before each
+// retry; its length is the number of retries before the build fails.
+var goldenRetryBackoff = []time.Duration{15 * time.Second, time.Minute, 4 * time.Minute}
+
+// goldenRetryJitter is the largest fraction added to a retry's backoff, so
+// goldens that crashed together do not reboot together.
+const goldenRetryJitter = 0.2
+
 // maxGoldenErrorMessageLen is the maxLength of
 // GoldenSnapshotStatus.error_message.
 const maxGoldenErrorMessageLen = 4096
@@ -82,6 +91,7 @@ type goldenActorControl interface {
 	GetActorEgressPolicy(ctx context.Context, req *ateapipb.GetActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error)
 	ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error)
 	SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error)
+	RevertActor(ctx context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error)
 }
 
 // ActorTemplateReconciler drives stored ActorTemplates through the golden
@@ -256,7 +266,36 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 
 		switch state := actor.GetStatus().GetState(); state {
 		case ateapipb.ActorState_ACTOR_STATE_CRASHED:
-			return 0, r.fail(ctx, tmpl, reasonGoldenActorCrashed, "golden actor crashed before its snapshot was taken")
+			crash := actor.GetStatus().GetCrash()
+			attempts := int(goldenSnapshotStatus.GetAttempts())
+			if crash.GetCrashTime() == nil || !proto.Equal(crash.GetCrashTime(), goldenSnapshotStatus.GetLastCrashTime()) {
+				// A crash no retry has answered yet. Count it before reverting,
+				// so a pass that dies mid-retry cannot boot the actor uncounted.
+				if attempts >= len(goldenRetryBackoff) {
+					return 0, r.fail(ctx, tmpl, reasonGoldenActorCrashed, goldenCrashMessage(attempts, crash.GetMessage()))
+				}
+				if tmpl, err = r.checkpoint(ctx, tmpl, func(snapshotStatus *ateapipb.GoldenSnapshotStatus) {
+					snapshotStatus.Attempts = int32(attempts + 1)
+					snapshotStatus.LastCrashTime = crash.GetCrashTime()
+					snapshotStatus.SnapshotTime = nil
+				}); err != nil {
+					return 0, err
+				}
+				slog.InfoContext(ctx, "Golden actor crashed; retrying",
+					slog.String("ActorTemplate", ref.String()),
+					slog.Int("attempt", attempts+1),
+					slog.String("crash", crash.GetMessage()))
+				continue
+			}
+			retryAt := crash.GetCrashTime().AsTime().Add(goldenRetryDelay(tmpl.GetMetadata().GetUid(), attempts))
+			if rem := time.Until(retryAt); rem > 0 {
+				return rem, nil
+			}
+			// The reverted actor is SUSPENDED with no snapshot, so the next
+			// iteration boots it fresh from the template.
+			if _, err := r.control.RevertActor(ctx, &ateapipb.RevertActorRequest{Actor: goldenActorRef}); err != nil {
+				return 0, fmt.Errorf("while reverting crashed golden actor: %w", err)
+			}
 
 		case ateapipb.ActorState_ACTOR_STATE_RUNNING:
 			takeAt := goldenSnapshotStatus.GetSnapshotTime()
@@ -294,8 +333,9 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 
 		case ateapipb.ActorState_ACTOR_STATE_RESUMING,
 			ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
-			// The golden actor was never resumed, or a previous resume didn't
-			// finish; ResumeActor is reentrant from both.
+			// The golden actor was never resumed, was reverted after a crash,
+			// or a previous resume didn't finish; ResumeActor is reentrant
+			// from all three.
 			if findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED) != nil {
 				// Golden actors never start from a source snapshot, so an
 				// existing snapshot means an earlier suspend completed
@@ -318,9 +358,16 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 			}); err != nil {
 				return 0, err
 			}
-		case ateapipb.ActorState_ACTOR_STATE_DELETING, ateapipb.ActorState_ACTOR_STATE_REVERTING:
-			// Nothing in the golden flow deletes or reverts the actor before
-			// the snapshot is taken; someone else interfered.
+		case ateapipb.ActorState_ACTOR_STATE_REVERTING:
+			// A previous pass died mid-revert of a crash it already counted;
+			// RevertActor resumes where it stopped.
+			if _, err := r.control.RevertActor(ctx, &ateapipb.RevertActorRequest{Actor: goldenActorRef}); err != nil {
+				return 0, fmt.Errorf("while reverting crashed golden actor: %w", err)
+			}
+
+		case ateapipb.ActorState_ACTOR_STATE_DELETING:
+			// Nothing in the golden flow deletes the actor before the snapshot
+			// is taken; someone else interfered.
 			return 0, r.fail(ctx, tmpl, reasonUnexpectedState, fmt.Sprintf("golden actor in unexpected state %v", state))
 
 		default:
@@ -401,6 +448,27 @@ func (r *ActorTemplateReconciler) fail(ctx context.Context, observed *ateapipb.A
 		snapshotStatus.ErrorMessage = truncateUTF8(reason+": "+msg, maxGoldenErrorMessageLen)
 	})
 	return err
+}
+
+// goldenCrashMessage describes a golden build that ran out of retries, with
+// the last crash's cause.
+func goldenCrashMessage(attempts int, crashMessage string) string {
+	msg := fmt.Sprintf("golden actor crashed before its snapshot was taken, after %d retries", attempts)
+	if crashMessage == "" {
+		return msg
+	}
+	return msg + ": " + crashMessage
+}
+
+// goldenRetryDelay is the backoff before the given 1-based retry, plus a
+// jitter derived from the template UID so every pass and replica computes the
+// same delay.
+func goldenRetryDelay(templateUID string, attempt int) time.Duration {
+	backoff := goldenRetryBackoff[attempt-1]
+	h := fnv.New32a()
+	fmt.Fprintf(h, "%s/%d", templateUID, attempt)
+	fraction := float64(h.Sum32()%1000) / 1000
+	return backoff + time.Duration(fraction*goldenRetryJitter*float64(backoff))
 }
 
 // truncateUTF8 cuts s to at most n bytes without splitting a UTF-8 sequence,

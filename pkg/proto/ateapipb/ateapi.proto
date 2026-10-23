@@ -1266,6 +1266,18 @@ message GoldenSnapshotStatus {
   // +k8s:optional
   // +k8s:maxLength=4096
   string error_message = 3;
+
+  // attempts counts the golden actor boots retried after a crash. The build
+  // fails once the golden actor crashes with attempts at the retry limit.
+  //
+  // +k8s:optional
+  int32 attempts = 4;
+
+  // last_crash_time is the crash_time of the golden actor crash the latest
+  // retry answers, so each crash is counted once.
+  //
+  // +k8s:optional
+  google.protobuf.Timestamp last_crash_time = 5;
 }
 
 message ActorTemplateStatus {

@@ -159,6 +159,7 @@ type fakeGoldenControl struct {
 	resumeErr  error
 	suspendErr error
 	getErr     error
+	revertErr  error
 
 	// exists seeds whether the golden actor pre-exists; goldenState and
 	// goldenSnapshot are its observed state and external snapshot while it
@@ -166,6 +167,11 @@ type fakeGoldenControl struct {
 	exists         bool
 	goldenState    ateapipb.ActorState
 	goldenSnapshot string
+	// crash is the golden actor's crash record, reported while it exists.
+	crash *ateapipb.ActorCrash
+	// crashOnResume makes every resume crash the golden actor with a new
+	// crash record, as a build hitting the same fault each boot does.
+	crashOnResume bool
 	// snapshot is the external snapshot a completed suspend produces; empty
 	// simulates a suspend that wrote none.
 	snapshot string
@@ -173,6 +179,7 @@ type fakeGoldenControl struct {
 	createReqs   []*ateapipb.CreateActorRequest
 	resumeReqs   []*ateapipb.ResumeActorRequest
 	suspendReqs  []*ateapipb.SuspendActorRequest
+	revertReqs   []*ateapipb.RevertActorRequest
 	atespaceReqs []*ateapipb.CreateAtespaceRequest
 }
 
@@ -184,7 +191,7 @@ func (c *fakeGoldenControl) CreateAtespace(_ context.Context, req *ateapipb.Crea
 }
 
 func (c *fakeGoldenControl) goldenActorStatus() *ateapipb.ActorStatus {
-	st := &ateapipb.ActorStatus{State: c.goldenState}
+	st := &ateapipb.ActorStatus{State: c.goldenState, Crash: proto.CloneOf(c.crash)}
 	if c.goldenSnapshot != "" {
 		st.LastAssignedGeneration = 1
 		st.Snapshots = []*ateapipb.Snapshot{
@@ -236,8 +243,36 @@ func (c *fakeGoldenControl) ResumeActor(_ context.Context, req *ateapipb.ResumeA
 	if c.resumeErr != nil {
 		return nil, c.resumeErr
 	}
+	if c.crashOnResume {
+		c.goldenState = ateapipb.ActorState_ACTOR_STATE_CRASHED
+		// Crash times are an hour old so every retry backoff has passed, and
+		// distinct so each resume is a new crash.
+		c.crash = &ateapipb.ActorCrash{
+			Message:   "resume failed: assigned worker is draining",
+			CrashTime: timestamppb.New(time.Now().Add(-time.Hour).Add(time.Duration(len(c.resumeReqs)) * time.Second)),
+		}
+		return nil, apierror.Aborted("golden actor crashed during resume")
+	}
 	c.goldenState = ateapipb.ActorState_ACTOR_STATE_RUNNING
 	return &ateapipb.ResumeActorResponse{}, nil
+}
+
+func (c *fakeGoldenControl) RevertActor(_ context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.revertReqs = append(c.revertReqs, req)
+	if c.revertErr != nil {
+		return nil, c.revertErr
+	}
+	c.goldenState = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+	c.crash = nil
+	return &ateapipb.RevertActorResponse{Actor: &ateapipb.Actor{Status: c.goldenActorStatus()}}, nil
+}
+
+func (c *fakeGoldenControl) reverts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.revertReqs)
 }
 
 func (c *fakeGoldenControl) CreateActorEgressPolicy(context.Context, *ateapipb.CreateActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
@@ -377,6 +412,18 @@ func withGoldenTag() func(*ateapipb.ActorTemplate) {
 	}
 }
 
+func withRetried(attempts int32, lastCrash time.Time) func(*ateapipb.ActorTemplate) {
+	return func(tmpl *ateapipb.ActorTemplate) {
+		st := seededGoldenStatus(tmpl)
+		st.Attempts = attempts
+		st.LastCrashTime = timestamppb.New(lastCrash)
+	}
+}
+
+func crashedAt(at time.Time) *ateapipb.ActorCrash {
+	return &ateapipb.ActorCrash{Message: "resume failed: assigned worker is draining", CrashTime: timestamppb.New(at)}
+}
+
 func withFailed(reason string) func(*ateapipb.ActorTemplate) {
 	return func(tmpl *ateapipb.ActorTemplate) {
 		seededGoldenStatus(tmpl).ErrorMessage = reason + ": seeded failure"
@@ -408,6 +455,7 @@ func TestGoldenSnapshotWarmupFor(t *testing.T) {
 }
 
 func TestReconcileOne(t *testing.T) {
+	now := time.Now()
 	goldenSnapshot := "gs://bucket/root/atespaces/ns/actors/" + someActorUID + "/snapshots/snap-1"
 	tests := []struct {
 		name     string
@@ -432,6 +480,8 @@ func TestReconcileOne(t *testing.T) {
 		wantCreates   int
 		wantResumes   int
 		wantSuspends  int
+		wantReverts   int
+		wantAttempts  int32
 		wantUnchanged bool
 	}{
 		{
@@ -528,11 +578,58 @@ func TestReconcileOne(t *testing.T) {
 			wantCreates: 1,
 		},
 		{
-			name:             "crashed golden actor fails the template",
-			template:         testTemplate(),
-			control:          &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED},
+			name:           "first golden actor crash counts a retry and waits its backoff",
+			template:       testTemplate(),
+			control:        &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, crash: crashedAt(now)},
+			wantRequeueMin: 14 * time.Second,
+			wantRequeueMax: 18 * time.Second,
+			wantAttempts:   1,
+		},
+		{
+			name:           "counted crash inside its backoff keeps waiting",
+			template:       testTemplate(withRetried(2, now.Add(-10*time.Second))),
+			control:        &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, crash: crashedAt(now.Add(-10 * time.Second))},
+			wantRequeueMin: 49 * time.Second,
+			wantRequeueMax: 62 * time.Second,
+			wantAttempts:   2,
+		},
+		{
+			name:         "counted crash past its backoff reverts and reboots the golden actor",
+			template:     testTemplate(withRetried(1, now.Add(-time.Minute))),
+			control:      &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, crash: crashedAt(now.Add(-time.Minute)), snapshot: goldenSnapshot},
+			wantTag:      true,
+			wantDeadline: true,
+			wantResumes:  1,
+			wantSuspends: 1,
+			wantReverts:  1,
+			wantAttempts: 1,
+		},
+		{
+			name:         "revert failure requeues without counting the crash again",
+			template:     testTemplate(withRetried(1, now.Add(-time.Minute))),
+			control:      &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, crash: crashedAt(now.Add(-time.Minute)), revertErr: apierror.Unavailable("atelet down")},
+			wantErr:      true,
+			wantReverts:  1,
+			wantAttempts: 1,
+		},
+		{
+			name:         "reverting golden actor finishes the revert and reboots",
+			template:     testTemplate(withRetried(1, now.Add(-time.Minute))),
+			control:      &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_REVERTING, snapshot: goldenSnapshot},
+			wantTag:      true,
+			wantDeadline: true,
+			wantResumes:  1,
+			wantSuspends: 1,
+			wantReverts:  1,
+			wantAttempts: 1,
+		},
+		{
+			name:             "crash after the last retry fails the template with the crash cause",
+			template:         testTemplate(withRetried(3, now.Add(-time.Hour))),
+			control:          &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, crash: crashedAt(now)},
 			wantFailedReason: reasonGoldenActorCrashed,
-			wantMessage:      "crashed",
+			wantMessage:      "after 3 retries: resume failed: assigned worker is draining",
+			wantAttempts:     3,
 		},
 		{
 			name:        "resume failure requeues without failing",
@@ -644,7 +741,60 @@ func TestReconcileOne(t *testing.T) {
 			if tt.wantDeadline && snapshotStatus.GetSnapshotTime() == nil {
 				t.Error("stored snapshot_time is nil, want set")
 			}
+			if got := tt.control.reverts(); got != tt.wantReverts {
+				t.Errorf("reverts = %d, want %d", got, tt.wantReverts)
+			}
+			if got := snapshotStatus.GetAttempts(); got != tt.wantAttempts {
+				t.Errorf("stored attempts = %d, want %d", got, tt.wantAttempts)
+			}
 		})
+	}
+}
+
+// A golden actor that crashes on every boot is booted once plus once per
+// retry, then the template fails with the last crash's cause.
+func TestReconcileOne_GoldenCrashRetriesUntilBudgetSpent(t *testing.T) {
+	st := newFakeTemplateStore(testTemplate())
+	control := &fakeGoldenControl{crashOnResume: true}
+	r := newTestTemplateReconciler(st, control)
+
+	for pass := 0; ; pass++ {
+		if pass > 10 {
+			t.Fatal("template did not reach a terminal state")
+		}
+		_, err := r.reconcileOne(t.Context(), testTemplateRef)
+		if err == nil {
+			break
+		}
+	}
+
+	snapshotStatus := st.storedStatus(t, testTemplateRef).GetGoldenSnapshotStatus()
+	if want := reasonGoldenActorCrashed + ": golden actor crashed before its snapshot was taken, after 3 retries: resume failed: assigned worker is draining"; snapshotStatus.GetErrorMessage() != want {
+		t.Errorf("stored error message = %q, want %q", snapshotStatus.GetErrorMessage(), want)
+	}
+	if got := snapshotStatus.GetAttempts(); got != int32(len(goldenRetryBackoff)) {
+		t.Errorf("stored attempts = %d, want %d", got, len(goldenRetryBackoff))
+	}
+	if _, resumes, _ := control.callCounts(); resumes != len(goldenRetryBackoff)+1 {
+		t.Errorf("resumes = %d, want %d", resumes, len(goldenRetryBackoff)+1)
+	}
+	if got := control.reverts(); got != len(goldenRetryBackoff) {
+		t.Errorf("reverts = %d, want %d", got, len(goldenRetryBackoff))
+	}
+}
+
+func TestGoldenRetryDelay(t *testing.T) {
+	for attempt, backoff := range goldenRetryBackoff {
+		max := backoff + time.Duration(goldenRetryJitter*float64(backoff))
+		for _, uid := range []string{"uid-a", "uid-b", "uid-c"} {
+			got := goldenRetryDelay(uid, attempt+1)
+			if got < backoff || got > max {
+				t.Errorf("goldenRetryDelay(%q, %d) = %v, want in [%v, %v]", uid, attempt+1, got, backoff, max)
+			}
+			if again := goldenRetryDelay(uid, attempt+1); again != got {
+				t.Errorf("goldenRetryDelay(%q, %d) = %v then %v, want stable", uid, attempt+1, got, again)
+			}
+		}
 	}
 }
 
