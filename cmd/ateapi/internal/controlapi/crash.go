@@ -49,6 +49,17 @@ const (
 	crashMessageWorkerRestarted          = "worker restarted while hosting the actor"
 )
 
+// workerLostCrashMessages are the crash messages ate-api records when the
+// actor's worker went away under it. Crashes with them set
+// ActorCrash.worker_lost.
+var workerLostCrashMessages = map[string]bool{
+	crashMessageWorkerGone:       true,
+	crashMessageWorkerDraining:   true,
+	crashMessageWorkerReassigned: true,
+	crashMessageWorkerPodGone:    true,
+	crashMessageWorkerRestarted:  true,
+}
+
 // maxCrashMessageBytes matches the maxLength on ActorCrash.message.
 const maxCrashMessageBytes = 4096
 
@@ -183,12 +194,14 @@ func crashActorVersion(ctx context.Context, st crashActorStore, actorRef resourc
 // newActorCrash records a crash that happens now, prefixing message with the
 // operation that failed when it is known.
 func newActorCrash(opName, message string) *ateapipb.ActorCrash {
+	workerLost := workerLostCrashMessages[message]
 	if opName = ateattr.NormalizeOperationName(opName); opName != ateattr.OperationUnknown {
 		message = opName + " failed: " + message
 	}
 	return &ateapipb.ActorCrash{
-		Message:   truncateUTF8(strings.ToValidUTF8(message, "�"), maxCrashMessageBytes),
-		CrashTime: timestamppb.Now(),
+		Message:    truncateUTF8(strings.ToValidUTF8(message, "�"), maxCrashMessageBytes),
+		CrashTime:  timestamppb.Now(),
+		WorkerLost: workerLost,
 	}
 }
 

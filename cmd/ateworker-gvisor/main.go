@@ -414,6 +414,16 @@ func (s *AteWorkerService) rejectIfDraining() error {
 	return nil
 }
 
+// runWorkloadError reports a RunWorkload that failed during graceful shutdown
+// as Unavailable: gracefulShutdown cancels in-flight boots, and the deferred
+// cleanup tears down what the boot set up, so the boot can run elsewhere.
+func (s *AteWorkerService) runWorkloadError(err error) error {
+	if err != nil && s.shuttingDown.Load() {
+		return apierror.Unavailable("worker shutting down: %v", err)
+	}
+	return err
+}
+
 // cancelStartups cancels all boots and restores, leaving checkpoints running.
 func cancelStartups(ctx context.Context, inFlight *actorlock.InFlight) {
 	for _, actorUID := range inFlight.CancelStartups() {
@@ -626,6 +636,7 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		return nil, err
 	}
 	defer release()
+	defer func() { retErr = s.runWorkloadError(retErr) }()
 	if err := resetRunscStateAndPidFileDirs(req.GetActorDirs()); err != nil {
 		return nil, err
 	}

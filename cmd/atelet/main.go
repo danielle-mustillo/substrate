@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/spf13/pflag"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
@@ -749,6 +750,10 @@ type Atelet struct {
 	// failures, so a restore that can never succeed stops being retried (see
 	// boundRetryableRestoreError).
 	restoreFailures restoreFailureCounter
+	// runFailures counts each actor's consecutive Run failures that
+	// runInfraError reports as Unavailable (see boundRetryableRunError). Its
+	// streaks carry no snapshot.
+	runFailures restoreFailureCounter
 	// bootID is the node's boot ID (see readBootID), recorded in the manifest
 	// of each local snapshot. A local snapshot recording another, or none,
 	// was written before the node last rebooted.
@@ -815,6 +820,13 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+	defer func() {
+		if infraErr := runInfraError(err); infraErr != nil {
+			err = s.boundRetryableRunError(actorUID, infraErr)
+		} else if endsRestoreFailureStreak(err) {
+			s.runFailures.reset(actorUID)
+		}
+	}()
 
 	// The sandbox binaries are the runtime the control plane assigned the
 	// actor to, resolved through the index. Resolved before any on-node work,
@@ -1862,6 +1874,44 @@ func workerCallError(rpc string, err error) error {
 	return fmt.Errorf("while calling worker %s: %w", rpc, err)
 }
 
+// maxConsecutiveRetryableRunFailures is the number of consecutive Run
+// failures that runInfraError reports as Unavailable at which atelet gives up
+// and reports the failure as Internal, crashing the actor. The control plane's
+// golden retries wait 15s doubling to 4m, so five attempts span about 4
+// minutes and a sixth would start after their 5.5 minute window.
+const maxConsecutiveRetryableRunFailures = 5
+
+// runInfraError returns err as Unavailable when Run failed on the node's disk
+// space or quota, or on a registry error the registry marks temporary, so the
+// control plane keeps the actor RESUMING and retries. It returns nil for any
+// other err, including a registry that reports the image missing.
+func runInfraError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
+		return apierror.Unavailable("node is out of disk space: %v", err)
+	}
+	var terr *transport.Error
+	if errors.As(err, &terr) && terr.Temporary() {
+		return apierror.Unavailable("temporary image registry error: %v", err)
+	}
+	return nil
+}
+
+// boundRetryableRunError counts a Run failure runInfraError reported for
+// actorUID and, once the actor has failed maxConsecutiveRetryableRunFailures
+// times in a row, reports it as Internal so the control plane crashes the
+// actor rather than retrying again.
+func (s *Atelet) boundRetryableRunError(actorUID string, err error) error {
+	n := s.runFailures.add(actorUID, "")
+	if n < maxConsecutiveRetryableRunFailures {
+		return err
+	}
+	s.runFailures.reset(actorUID)
+	return apierror.Internal("run failed with a retryable error %d times in a row, giving up: %v", n, err)
+}
+
 // DetachActor makes the actor's latest local snapshot durable, then deletes the
 // actor's local snapshots on this node.
 func (s *Atelet) DetachActor(ctx context.Context, req *ateletpb.DetachActorRequest) (*ateletpb.DetachActorResponse, error) {
@@ -2036,6 +2086,7 @@ func (s *Atelet) Terminate(ctx context.Context, req *ateletpb.TerminateRequest) 
 		return nil, fmt.Errorf("failed to remove actor directories during terminate (actor: %s, actorUID: %s): %w", actorRef, actorUID, err)
 	}
 	s.restoreFailures.reset(actorUID)
+	s.runFailures.reset(actorUID)
 
 	return &ateletpb.TerminateResponse{}, nil
 }

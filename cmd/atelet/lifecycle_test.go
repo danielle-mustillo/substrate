@@ -19,7 +19,9 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,9 +29,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"go.ate.dev/substrate/cmd/atelet/internal/actordirs"
 	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
 	"go.ate.dev/substrate/cmd/atelet/internal/filecache"
@@ -757,12 +761,64 @@ func TestRunFailureAfterRegistrationRemovesOwnRegistration(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `while creating "app" OCI bundle`) {
 		t.Fatalf("Run error = %v, want the post-registration OCI preparation failure", err)
 	}
+	if code := apierror.Code(err); code != codes.Internal {
+		t.Errorf("Run error code = %v, want %v: a missing image is not retried", code, codes.Internal)
+	}
 	if _, err := os.ReadFile(filepath.Join(ateletpath.SystemInfoVolumeRoot(actorUID, "trust"), "ca.pem")); err != nil {
 		t.Fatalf("Register did not write its projection before OCI preparation failed: %v", err)
 	}
 	if got := refresher.actors[actorUID]; got != nil {
 		t.Fatalf("failed Run left its registration live: %p", got)
 	}
+}
+
+func TestRunInfraError(t *testing.T) {
+	// The chain imagecache builds for a layer write that fills the disk.
+	diskFull := fmt.Errorf("in imageCache.EnsureImage(%q): %w", "img",
+		fmt.Errorf("while unpacking layer sha256:abc: %w",
+			fmt.Errorf("while writing contents of %q from tar stream: %w", "app",
+				&fs.PathError{Op: "write", Path: "/var/lib/ate/image-cache/app", Err: syscall.ENOSPC})))
+	tests := []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{name: "success", err: nil, want: codes.OK},
+		{name: "disk full", err: diskFull, want: codes.Unavailable},
+		{name: "disk quota", err: fmt.Errorf("while writing: %w", syscall.EDQUOT), want: codes.Unavailable},
+		{name: "registry unavailable", err: fmt.Errorf("pull: %w", &transport.Error{StatusCode: http.StatusServiceUnavailable}), want: codes.Unavailable},
+		{name: "manifest unknown", err: fmt.Errorf("pull: %w", &transport.Error{StatusCode: http.StatusNotFound, Errors: []transport.Diagnostic{{Code: transport.ManifestUnknownErrorCode}}}), want: codes.OK},
+		{name: "unauthorized", err: fmt.Errorf("pull: %w", &transport.Error{StatusCode: http.StatusUnauthorized, Errors: []transport.Diagnostic{{Code: transport.UnauthorizedErrorCode}}}), want: codes.OK},
+		{name: "workload start failure", err: errors.New("runsc start: exit status 128"), want: codes.OK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := apierror.Code(runInfraError(tt.err)); got != tt.want {
+				t.Errorf("runInfraError() code = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBoundRetryableRunError(t *testing.T) {
+	s := &Atelet{}
+	retryable := apierror.Unavailable("node is out of disk space")
+	failRetryably := func(actorUID string, times int, when string) {
+		t.Helper()
+		for i := range times {
+			if got := apierror.Code(s.boundRetryableRunError(actorUID, retryable)); got != codes.Unavailable {
+				t.Fatalf("failure %d %s: code = %v, want %v", i+1, when, got, codes.Unavailable)
+			}
+		}
+	}
+	failRetryably("actor-1", maxConsecutiveRetryableRunFailures-1, "at first")
+	if got := apierror.Code(s.boundRetryableRunError("actor-1", retryable)); got != codes.Internal {
+		t.Fatalf("failure %d: code = %v, want %v", maxConsecutiveRetryableRunFailures, got, codes.Internal)
+	}
+	failRetryably("actor-1", maxConsecutiveRetryableRunFailures-1, "after giving up")
+	s.runFailures.reset("actor-1")
+	failRetryably("actor-1", maxConsecutiveRetryableRunFailures-1, "after a success")
+	failRetryably("actor-2", maxConsecutiveRetryableRunFailures-1, "of another actor")
 }
 
 // missingImage returns a digest-pinned reference that passes request

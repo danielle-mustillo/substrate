@@ -44,6 +44,15 @@ const (
 	// the golden actor and taking its snapshot, for templates without a
 	// wakeup probe on every container.
 	goldenSnapshotWarmup = 20 * time.Second
+
+	// Golden retries wait goldenRetryBase, doubling up to goldenRetryMax: a
+	// reboot after a worker-lost crash, and a resume after an UNAVAILABLE one.
+	goldenRetryBase = 15 * time.Second
+	goldenRetryMax  = 4 * time.Minute
+
+	// workerLostRetryWindow bounds reboots after worker-lost crashes. No
+	// reboot starts later than this after the first such crash.
+	workerLostRetryWindow = 330 * time.Second
 )
 
 const (
@@ -82,6 +91,7 @@ type goldenActorControl interface {
 	GetActorEgressPolicy(ctx context.Context, req *ateapipb.GetActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error)
 	ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error)
 	SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error)
+	RevertActor(ctx context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error)
 }
 
 // ActorTemplateReconciler drives stored ActorTemplates through the golden
@@ -256,7 +266,41 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 
 		switch state := actor.GetStatus().GetState(); state {
 		case ateapipb.ActorState_ACTOR_STATE_CRASHED:
-			return 0, r.fail(ctx, tmpl, reasonGoldenActorCrashed, "golden actor crashed before its snapshot was taken")
+			crash := actor.GetStatus().GetCrash()
+			if !crash.GetWorkerLost() {
+				return 0, r.fail(ctx, tmpl, reasonGoldenActorCrashed, "golden actor crashed before its snapshot was taken")
+			}
+			retries := goldenSnapshotStatus.GetWorkerLostRetries()
+			crashTime := crash.GetCrashTime().AsTime()
+			retryAt := crashTime.Add(goldenRetryDelay(retries))
+			deadline := crashTime.Add(workerLostRetryWindow)
+			if d := goldenSnapshotStatus.GetWorkerLostRetryDeadline(); d != nil {
+				deadline = d.AsTime()
+			}
+			if retryAt.After(deadline) {
+				return 0, r.fail(ctx, tmpl, reasonGoldenActorCrashed, fmt.Sprintf(
+					"golden actor crashed before its snapshot was taken: its worker was lost %d times: %s", retries+1, crash.GetMessage()))
+			}
+			if rem := time.Until(retryAt); rem > 0 {
+				return rem, nil
+			}
+			slog.InfoContext(ctx, "Rebooting golden actor after its worker was lost",
+				slog.String("ActorTemplate", ref.String()),
+				slog.Int("retry", int(retries)+1),
+				slog.String("crash", crash.GetMessage()))
+			// Counted before the revert, so a revert that fails still uses up
+			// a retry and the reboots stay bounded.
+			if tmpl, err = r.checkpoint(ctx, tmpl, func(snapshotStatus *ateapipb.GoldenSnapshotStatus) {
+				snapshotStatus.WorkerLostRetries = retries + 1
+				snapshotStatus.WorkerLostRetryDeadline = timestamppb.New(deadline)
+				snapshotStatus.UnavailableResumes = 0
+				snapshotStatus.NextResumeTime = nil
+			}); err != nil {
+				return 0, err
+			}
+			if err := r.revertActor(ctx, goldenActorRef); err != nil {
+				return 0, err
+			}
 
 		case ateapipb.ActorState_ACTOR_STATE_RUNNING:
 			takeAt := goldenSnapshotStatus.GetSnapshotTime()
@@ -308,17 +352,51 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 				}
 				return 0, fmt.Errorf("while ensuring golden egress policy: %w", err)
 			}
+			if next := goldenSnapshotStatus.GetNextResumeTime(); next != nil {
+				if rem := time.Until(next.AsTime()); rem > 0 {
+					return rem, nil
+				}
+			}
 			if _, err := r.control.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: goldenActorRef}); err != nil {
-				// A crash during resume is observed as CRASHED on the retry.
-				return 0, fmt.Errorf("while resuming golden actor: %w", err)
+				if apierror.Code(err) != codes.Unavailable {
+					// A crash during resume is observed as CRASHED on the retry.
+					return 0, fmt.Errorf("while resuming golden actor: %w", err)
+				}
+				// The resume left the actor RESUMING. Retry on a backoff kept in
+				// the template, so every replica waits it out.
+				failures := goldenSnapshotStatus.GetUnavailableResumes()
+				delay := goldenRetryDelay(failures)
+				slog.ErrorContext(ctx, "Golden actor resume unavailable, retrying",
+					slog.String("ActorTemplate", ref.String()),
+					slog.Int("failures", int(failures)+1),
+					slog.Duration("retryAfter", delay),
+					slog.Any("err", err))
+				if _, err := r.checkpoint(ctx, tmpl, func(snapshotStatus *ateapipb.GoldenSnapshotStatus) {
+					snapshotStatus.UnavailableResumes = failures + 1
+					snapshotStatus.NextResumeTime = timestamppb.New(time.Now().Add(delay))
+				}); err != nil {
+					return 0, err
+				}
+				return delay, nil
 			}
 			deadline := time.Now().Add(goldenSnapshotWarmupFor(tmpl.GetContainers()))
 			if tmpl, err = r.checkpoint(ctx, tmpl, func(snapshotStatus *ateapipb.GoldenSnapshotStatus) {
 				snapshotStatus.SnapshotTime = timestamppb.New(deadline)
+				snapshotStatus.UnavailableResumes = 0
+				snapshotStatus.NextResumeTime = nil
 			}); err != nil {
 				return 0, err
 			}
-		case ateapipb.ActorState_ACTOR_STATE_DELETING, ateapipb.ActorState_ACTOR_STATE_REVERTING:
+		case ateapipb.ActorState_ACTOR_STATE_REVERTING:
+			if goldenSnapshotStatus.GetWorkerLostRetries() == 0 {
+				return 0, r.fail(ctx, tmpl, reasonUnexpectedState, fmt.Sprintf("golden actor in unexpected state %v", state))
+			}
+			// A reboot after a worker-lost crash stopped mid-revert.
+			if err := r.revertActor(ctx, goldenActorRef); err != nil {
+				return 0, err
+			}
+
+		case ateapipb.ActorState_ACTOR_STATE_DELETING:
 			// Nothing in the golden flow deletes or reverts the actor before
 			// the snapshot is taken; someone else interfered.
 			return 0, r.fail(ctx, tmpl, reasonUnexpectedState, fmt.Sprintf("golden actor in unexpected state %v", state))
@@ -344,6 +422,26 @@ func (r *ActorTemplateReconciler) suspendActor(ctx context.Context, goldenRef *a
 		return fmt.Errorf("suspending golden actor produced no external snapshot")
 	}
 	return nil
+}
+
+// revertActor returns a crashed golden actor to SUSPENDED for a fresh boot.
+func (r *ActorTemplateReconciler) revertActor(ctx context.Context, ref *ateapipb.ObjectRef) error {
+	if _, err := r.control.RevertActor(ctx, &ateapipb.RevertActorRequest{Actor: ref}); err != nil {
+		return fmt.Errorf("while reverting golden actor: %w", err)
+	}
+	return nil
+}
+
+// goldenRetryDelay is the wait before golden retry n, counted from 0.
+func goldenRetryDelay(n int32) time.Duration {
+	delay := goldenRetryBase
+	for range n {
+		if delay >= goldenRetryMax {
+			break
+		}
+		delay *= 2
+	}
+	return min(delay, goldenRetryMax)
 }
 
 // tagGoldenActor copies the snapshot into a tag before releasing the actor's copy.

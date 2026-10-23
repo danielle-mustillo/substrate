@@ -452,6 +452,34 @@ func Validate_ActorCrash(
 		errs = append(errs, fn(fldPath.Child("crash_time"), obj.CrashTime, oldVal, oldObj != nil)...)
 	}
 
+	{ // field ateapipb.ActorCrash.WorkerLost
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *bool,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if obj == oldObj || (obj != nil && oldObj != nil && *obj == *oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalValue(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *ateapipb.ActorCrash) *bool {
+				return &oldObj.WorkerLost
+			})
+		errs = append(errs, fn(fldPath.Child("worker_lost"), &obj.WorkerLost, oldVal, oldObj != nil)...)
+	}
+
 	return errs
 }
 
@@ -4902,6 +4930,124 @@ func Validate_GoldenSnapshotStatus(
 				return &oldObj.ErrorMessage
 			})
 		errs = append(errs, fn(fldPath.Child("error_message"), &obj.ErrorMessage, oldVal, oldObj != nil)...)
+	}
+
+	{ // field ateapipb.GoldenSnapshotStatus.WorkerLostRetries
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *int32,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if obj == oldObj || (obj != nil && oldObj != nil && *obj == *oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalValue(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			if e := validate.Minimum(ctx, op, fldPath, obj, oldObj, 0); len(e) != 0 {
+				errs = append(errs, e...)
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *ateapipb.GoldenSnapshotStatus) *int32 {
+				return &oldObj.WorkerLostRetries
+			})
+		errs = append(errs, fn(fldPath.Child("worker_lost_retries"), &obj.WorkerLostRetries, oldVal, oldObj != nil)...)
+	}
+
+	{ // field ateapipb.GoldenSnapshotStatus.WorkerLostRetryDeadline
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *timestamppb.Timestamp,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if ateDeepEqual(obj, oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalPointer(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *ateapipb.GoldenSnapshotStatus) *timestamppb.Timestamp {
+				return oldObj.WorkerLostRetryDeadline
+			})
+		errs = append(errs, fn(fldPath.Child("worker_lost_retry_deadline"), obj.WorkerLostRetryDeadline, oldVal, oldObj != nil)...)
+	}
+
+	{ // field ateapipb.GoldenSnapshotStatus.UnavailableResumes
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *int32,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if obj == oldObj || (obj != nil && oldObj != nil && *obj == *oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalValue(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			if e := validate.Minimum(ctx, op, fldPath, obj, oldObj, 0); len(e) != 0 {
+				errs = append(errs, e...)
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *ateapipb.GoldenSnapshotStatus) *int32 {
+				return &oldObj.UnavailableResumes
+			})
+		errs = append(errs, fn(fldPath.Child("unavailable_resumes"), &obj.UnavailableResumes, oldVal, oldObj != nil)...)
+	}
+
+	{ // field ateapipb.GoldenSnapshotStatus.NextResumeTime
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *timestamppb.Timestamp,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if ateDeepEqual(obj, oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalPointer(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *ateapipb.GoldenSnapshotStatus) *timestamppb.Timestamp {
+				return oldObj.NextResumeTime
+			})
+		errs = append(errs, fn(fldPath.Child("next_resume_time"), obj.NextResumeTime, oldVal, oldObj != nil)...)
 	}
 
 	return errs

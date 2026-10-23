@@ -135,6 +135,9 @@ func TestDeleteWorkerWorkflow_ReleasesBoundActor(t *testing.T) {
 	if msg := got.GetStatus().GetCrash().GetMessage(); msg != crashMessageWorkerPodGone {
 		t.Errorf("crash message = %q, want %q", msg, crashMessageWorkerPodGone)
 	}
+	if !got.GetStatus().GetCrash().GetWorkerLost() {
+		t.Error("crash worker_lost = false, want true")
+	}
 	if got.GetStatus().GetWorkerAssignment() != nil {
 		t.Errorf("actor worker assignment = %v, want it cleared", got.GetStatus().GetWorkerAssignment())
 	}

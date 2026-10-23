@@ -924,6 +924,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 		wantActorState ateapipb.ActorState
 		// wantCrashMessage is the crash recorded when the actor is crashed.
 		wantCrashMessage string
+		wantWorkerLost   bool
 		// wantAssignment is the assignment expected on the stored worker
 		// afterwards; wantWorkerWrite false additionally asserts the worker
 		// version did not move (no write at all).
@@ -935,6 +936,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerGone,
+			wantWorkerLost:   true,
 		},
 		{
 			name:             "crashes actor and leaves worker untouched when worker is draining",
@@ -943,6 +945,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerDraining,
+			wantWorkerLost:   true,
 			wantAssignment:   ownAssignment,
 		},
 		{
@@ -974,6 +977,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerReassigned,
+			wantWorkerLost:   true,
 			wantAssignment:   otherAssignment,
 		},
 		{
@@ -983,6 +987,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerReassigned,
+			wantWorkerLost:   true,
 			wantAssignment:   staleIncarnationAssignment,
 		},
 		{
@@ -992,6 +997,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerReassigned,
+			wantWorkerLost:   true,
 			wantAssignment:   nil,
 		},
 		{
@@ -1075,6 +1081,9 @@ func TestValidateAssignedWorker(t *testing.T) {
 			}
 			if msg := actor.GetStatus().GetCrash().GetMessage(); msg != tt.wantCrashMessage {
 				t.Errorf("crash message = %q, want %q", msg, tt.wantCrashMessage)
+			}
+			if got := actor.GetStatus().GetCrash().GetWorkerLost(); got != tt.wantWorkerLost {
+				t.Errorf("crash worker_lost = %v, want %v", got, tt.wantWorkerLost)
 			}
 
 			if tt.workerStatus == nil {

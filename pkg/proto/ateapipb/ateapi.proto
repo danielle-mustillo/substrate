@@ -967,6 +967,13 @@ message ActorCrash {
   //
   // +k8s:optional
   google.protobuf.Timestamp crash_time = 2;
+
+  // worker_lost is set when ate-api crashed the Actor because its assigned
+  // worker went away, drained, restarted or stopped hosting it, so the
+  // failure is not the Actor's own.
+  //
+  // +k8s:optional
+  bool worker_lost = 3;
 }
 
 // WorkerAssignment points at the Worker currently hosting an Actor.
@@ -1266,6 +1273,32 @@ message GoldenSnapshotStatus {
   // +k8s:optional
   // +k8s:maxLength=4096
   string error_message = 3;
+
+  // worker_lost_retries counts the golden actor's reboots after crashes with
+  // ActorCrash.worker_lost set.
+  //
+  // +k8s:optional
+  // +k8s:minimum=0
+  int32 worker_lost_retries = 4;
+
+  // worker_lost_retry_deadline is set at the first reboot after a worker-lost
+  // crash. No reboot starts after it.
+  //
+  // +k8s:optional
+  google.protobuf.Timestamp worker_lost_retry_deadline = 5;
+
+  // unavailable_resumes counts the golden actor's consecutive resumes that
+  // failed as UNAVAILABLE.
+  //
+  // +k8s:optional
+  // +k8s:minimum=0
+  int32 unavailable_resumes = 6;
+
+  // next_resume_time is the earliest time the golden actor is resumed again
+  // after an UNAVAILABLE resume.
+  //
+  // +k8s:optional
+  google.protobuf.Timestamp next_resume_time = 7;
 }
 
 message ActorTemplateStatus {

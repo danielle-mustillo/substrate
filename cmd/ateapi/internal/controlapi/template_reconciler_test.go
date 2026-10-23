@@ -158,6 +158,7 @@ type fakeGoldenControl struct {
 	createErr  error
 	resumeErr  error
 	suspendErr error
+	revertErr  error
 	getErr     error
 
 	// exists seeds whether the golden actor pre-exists; goldenState and
@@ -166,6 +167,7 @@ type fakeGoldenControl struct {
 	exists         bool
 	goldenState    ateapipb.ActorState
 	goldenSnapshot string
+	goldenCrash    *ateapipb.ActorCrash
 	// snapshot is the external snapshot a completed suspend produces; empty
 	// simulates a suspend that wrote none.
 	snapshot string
@@ -173,6 +175,7 @@ type fakeGoldenControl struct {
 	createReqs   []*ateapipb.CreateActorRequest
 	resumeReqs   []*ateapipb.ResumeActorRequest
 	suspendReqs  []*ateapipb.SuspendActorRequest
+	revertReqs   []*ateapipb.RevertActorRequest
 	atespaceReqs []*ateapipb.CreateAtespaceRequest
 }
 
@@ -184,7 +187,7 @@ func (c *fakeGoldenControl) CreateAtespace(_ context.Context, req *ateapipb.Crea
 }
 
 func (c *fakeGoldenControl) goldenActorStatus() *ateapipb.ActorStatus {
-	st := &ateapipb.ActorStatus{State: c.goldenState}
+	st := &ateapipb.ActorStatus{State: c.goldenState, Crash: c.goldenCrash}
 	if c.goldenSnapshot != "" {
 		st.LastAssignedGeneration = 1
 		st.Snapshots = []*ateapipb.Snapshot{
@@ -238,6 +241,24 @@ func (c *fakeGoldenControl) ResumeActor(_ context.Context, req *ateapipb.ResumeA
 	}
 	c.goldenState = ateapipb.ActorState_ACTOR_STATE_RUNNING
 	return &ateapipb.ResumeActorResponse{}, nil
+}
+
+func (c *fakeGoldenControl) RevertActor(_ context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.revertReqs = append(c.revertReqs, req)
+	if c.revertErr != nil {
+		return nil, c.revertErr
+	}
+	c.goldenState = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+	c.goldenCrash = nil
+	return &ateapipb.RevertActorResponse{Actor: &ateapipb.Actor{Status: c.goldenActorStatus()}}, nil
+}
+
+func (c *fakeGoldenControl) reverts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.revertReqs)
 }
 
 func (c *fakeGoldenControl) CreateActorEgressPolicy(context.Context, *ateapipb.CreateActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
@@ -383,8 +404,37 @@ func withFailed(reason string) func(*ateapipb.ActorTemplate) {
 	}
 }
 
+func withWorkerLostRetries(n int32, deadline time.Time) func(*ateapipb.ActorTemplate) {
+	return func(tmpl *ateapipb.ActorTemplate) {
+		seededGoldenStatus(tmpl).WorkerLostRetries = n
+		seededGoldenStatus(tmpl).WorkerLostRetryDeadline = timestamppb.New(deadline)
+	}
+}
+
+func withNextResumeTime(at time.Time) func(*ateapipb.ActorTemplate) {
+	return func(tmpl *ateapipb.ActorTemplate) {
+		seededGoldenStatus(tmpl).UnavailableResumes = 1
+		seededGoldenStatus(tmpl).NextResumeTime = timestamppb.New(at)
+	}
+}
+
+func workerLostCrash(at time.Time) *ateapipb.ActorCrash {
+	return &ateapipb.ActorCrash{Message: "resume failed: " + crashMessageWorkerDraining, CrashTime: timestamppb.New(at), WorkerLost: true}
+}
+
 func newTestTemplateReconciler(persistence templateReconcilerStore, control goldenActorControl) *ActorTemplateReconciler {
 	return NewActorTemplateReconciler(persistence, control, 7*time.Second)
+}
+
+func TestGoldenRetryDelay(t *testing.T) {
+	for n, want := range []time.Duration{15 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 4 * time.Minute} {
+		if got := goldenRetryDelay(int32(n)); got != want {
+			t.Errorf("goldenRetryDelay(%d) = %v, want %v", n, got, want)
+		}
+	}
+	if got := goldenRetryDelay(1 << 30); got != goldenRetryMax {
+		t.Errorf("goldenRetryDelay(1<<30) = %v, want %v", got, goldenRetryMax)
+	}
 }
 
 func TestGoldenSnapshotWarmupFor(t *testing.T) {
@@ -432,7 +482,12 @@ func TestReconcileOne(t *testing.T) {
 		wantCreates   int
 		wantResumes   int
 		wantSuspends  int
+		wantReverts   int
 		wantUnchanged bool
+		// wantWorkerLostRetries and wantUnavailableResumes are the stored
+		// retry counters.
+		wantWorkerLostRetries  int32
+		wantUnavailableResumes int32
 	}{
 		{
 			name:          "golden snapshot disabled is a noop",
@@ -535,9 +590,102 @@ func TestReconcileOne(t *testing.T) {
 			wantMessage:      "crashed",
 		},
 		{
-			name:        "resume failure requeues without failing",
+			name:             "crashed golden actor without a worker-lost crash fails the template",
+			template:         testTemplate(),
+			control:          &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, goldenCrash: &ateapipb.ActorCrash{Message: "resume failed: atelet Run: runsc start: exit status 128", CrashTime: timestamppb.Now()}},
+			wantFailedReason: reasonGoldenActorCrashed,
+			wantMessage:      "crashed",
+		},
+		{
+			name:                  "worker-lost crash reboots the golden actor once its backoff passed",
+			template:              testTemplate(),
+			control:               &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, goldenCrash: workerLostCrash(time.Now().Add(-goldenRetryBase)), snapshot: goldenSnapshot},
+			wantTag:               true,
+			wantDeadline:          true,
+			wantReverts:           1,
+			wantResumes:           1,
+			wantSuspends:          1,
+			wantWorkerLostRetries: 1,
+		},
+		{
+			name:           "worker-lost crash waits out its backoff",
+			template:       testTemplate(),
+			control:        &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, goldenCrash: workerLostCrash(time.Now())},
+			wantRequeueMin: goldenRetryBase - time.Second,
+			wantRequeueMax: goldenRetryBase,
+		},
+		{
+			name:                  "worker-lost crash backs off by the retries already made",
+			template:              testTemplate(withWorkerLostRetries(2, time.Now().Add(time.Hour))),
+			control:               &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, goldenCrash: workerLostCrash(time.Now())},
+			wantRequeueMin:        4*goldenRetryBase - time.Second,
+			wantRequeueMax:        4 * goldenRetryBase,
+			wantWorkerLostRetries: 2,
+		},
+		{
+			name:                  "worker-lost crash whose next reboot would start after the deadline fails the template",
+			template:              testTemplate(withWorkerLostRetries(4, time.Now().Add(time.Minute))),
+			control:               &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, goldenCrash: workerLostCrash(time.Now())},
+			wantFailedReason:      reasonGoldenActorCrashed,
+			wantMessage:           "its worker was lost 5 times: resume failed: " + crashMessageWorkerDraining,
+			wantWorkerLostRetries: 4,
+		},
+		{
+			name:                  "failed revert still uses up a retry",
+			template:              testTemplate(),
+			control:               &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED, goldenCrash: workerLostCrash(time.Now().Add(-time.Minute)), revertErr: apierror.Unavailable("lease busy")},
+			wantErr:               true,
+			wantReverts:           1,
+			wantWorkerLostRetries: 1,
+		},
+		{
+			name:                  "reverting golden actor after a worker-lost crash finishes the revert and boots",
+			template:              testTemplate(withWorkerLostRetries(1, time.Now().Add(time.Minute))),
+			control:               &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_REVERTING, snapshot: goldenSnapshot},
+			wantTag:               true,
+			wantDeadline:          true,
+			wantReverts:           1,
+			wantResumes:           1,
+			wantSuspends:          1,
+			wantWorkerLostRetries: 1,
+		},
+		{
+			name:             "reverting golden actor without a reboot fails the template",
+			template:         testTemplate(),
+			control:          &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_REVERTING},
+			wantFailedReason: reasonUnexpectedState,
+			wantMessage:      "unexpected state",
+		},
+		{
+			name:                   "unavailable resume requeues on the golden backoff",
+			template:               testTemplate(),
+			control:                &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, resumeErr: apierror.Unavailable("no workers")},
+			wantRequeueMin:         goldenRetryBase,
+			wantRequeueMax:         goldenRetryBase,
+			wantResumes:            1,
+			wantUnavailableResumes: 1,
+		},
+		{
+			name:                   "resume waits for its next resume time",
+			template:               testTemplate(withNextResumeTime(time.Now().Add(time.Minute))),
+			control:                &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_RESUMING},
+			wantRequeueMin:         time.Minute - time.Second,
+			wantRequeueMax:         time.Minute,
+			wantUnavailableResumes: 1,
+		},
+		{
+			name:         "resume after its next resume time succeeds and clears the backoff",
+			template:     testTemplate(withNextResumeTime(time.Now().Add(-time.Second))),
+			control:      &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_RESUMING, snapshot: goldenSnapshot},
+			wantTag:      true,
+			wantDeadline: true,
+			wantResumes:  1,
+			wantSuspends: 1,
+		},
+		{
+			name:        "resume failure other than unavailable requeues with an error",
 			template:    testTemplate(),
-			control:     &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, resumeErr: apierror.Unavailable("no workers")},
+			control:     &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, resumeErr: apierror.Aborted("actor crashed")},
 			wantErr:     true,
 			wantResumes: 1,
 		},
@@ -643,6 +791,21 @@ func TestReconcileOne(t *testing.T) {
 			}
 			if tt.wantDeadline && snapshotStatus.GetSnapshotTime() == nil {
 				t.Error("stored snapshot_time is nil, want set")
+			}
+			if got := tt.control.reverts(); got != tt.wantReverts {
+				t.Errorf("reverts = %d, want %d", got, tt.wantReverts)
+			}
+			if got := snapshotStatus.GetWorkerLostRetries(); got != tt.wantWorkerLostRetries {
+				t.Errorf("stored worker_lost_retries = %d, want %d", got, tt.wantWorkerLostRetries)
+			}
+			if tt.wantWorkerLostRetries > 0 && snapshotStatus.GetWorkerLostRetryDeadline() == nil {
+				t.Error("stored worker_lost_retry_deadline is nil, want set")
+			}
+			if got := snapshotStatus.GetUnavailableResumes(); got != tt.wantUnavailableResumes {
+				t.Errorf("stored unavailable_resumes = %d, want %d", got, tt.wantUnavailableResumes)
+			}
+			if (snapshotStatus.GetNextResumeTime() != nil) != (tt.wantUnavailableResumes > 0) {
+				t.Errorf("stored next_resume_time = %v, want set only with unavailable resumes", snapshotStatus.GetNextResumeTime())
 			}
 		})
 	}

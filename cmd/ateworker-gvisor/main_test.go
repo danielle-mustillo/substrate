@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -90,6 +91,22 @@ func TestStartupRPCsRejectedBeforeRegistration(t *testing.T) {
 		if got := apierror.Code(call()); got != codes.Unavailable {
 			t.Errorf("%s() before registration code = %v, want %v", name, got, codes.Unavailable)
 		}
+	}
+}
+
+// A boot that gracefulShutdown cancels is not the actor's fault.
+func TestRunWorkloadErrorDuringShutdownIsUnavailable(t *testing.T) {
+	s := &AteWorkerService{}
+	failed := errors.New("while starting the sandbox: runsc start: signal: killed")
+	if got := apierror.Code(s.runWorkloadError(failed)); got != codes.Internal {
+		t.Errorf("error before shutdown code = %v, want %v", got, codes.Internal)
+	}
+	s.shuttingDown.Store(true)
+	if got := apierror.Code(s.runWorkloadError(failed)); got != codes.Unavailable {
+		t.Errorf("error during shutdown code = %v, want %v", got, codes.Unavailable)
+	}
+	if err := s.runWorkloadError(nil); err != nil {
+		t.Errorf("success during shutdown = %v, want nil", err)
 	}
 }
 
