@@ -63,6 +63,10 @@ var goldenRetryBackoff = []time.Duration{15 * time.Second, time.Minute, 4 * time
 // goldens that crashed together do not reboot together.
 const goldenRetryJitter = 0.2
 
+// goldenRevertTimeout bounds how long a retry keeps failing to revert the
+// crashed golden actor before the build fails.
+const goldenRevertTimeout = 5 * time.Minute
+
 // maxGoldenErrorMessageLen is the maxLength of
 // GoldenSnapshotStatus.error_message.
 const maxGoldenErrorMessageLen = 4096
@@ -265,10 +269,16 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 		}
 
 		switch state := actor.GetStatus().GetState(); state {
-		case ateapipb.ActorState_ACTOR_STATE_CRASHED:
+		case ateapipb.ActorState_ACTOR_STATE_CRASHED, ateapipb.ActorState_ACTOR_STATE_REVERTING:
+			// REVERTING keeps the crash record until the revert finishes, so a
+			// pass that died mid-revert finds the crash it already counted.
 			crash := actor.GetStatus().GetCrash()
 			attempts := int(goldenSnapshotStatus.GetAttempts())
 			if crash.GetCrashTime() == nil || !proto.Equal(crash.GetCrashTime(), goldenSnapshotStatus.GetLastCrashTime()) {
+				if state == ateapipb.ActorState_ACTOR_STATE_REVERTING {
+					// Only a counted crash is reverted here; someone else interfered.
+					return 0, r.fail(ctx, tmpl, reasonUnexpectedState, fmt.Sprintf("golden actor in unexpected state %v", state))
+				}
 				// A crash no retry has answered yet. Count it before reverting,
 				// so a pass that dies mid-retry cannot boot the actor uncounted.
 				if attempts >= len(goldenRetryBackoff) {
@@ -294,6 +304,11 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 			// The reverted actor is SUSPENDED with no snapshot, so the next
 			// iteration boots it fresh from the template.
 			if _, err := r.control.RevertActor(ctx, &ateapipb.RevertActorRequest{Actor: goldenActorRef}); err != nil {
+				// A revert can fail for as long as the crashed actor's atelet
+				// is unreachable; give up rather than keep the build open.
+				if time.Since(retryAt) > goldenRevertTimeout {
+					return 0, r.fail(ctx, tmpl, reasonGoldenActorCrashed, fmt.Sprintf("could not revert the crashed golden actor: %v", err))
+				}
 				return 0, fmt.Errorf("while reverting crashed golden actor: %w", err)
 			}
 
@@ -358,13 +373,6 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 			}); err != nil {
 				return 0, err
 			}
-		case ateapipb.ActorState_ACTOR_STATE_REVERTING:
-			// A previous pass died mid-revert of a crash it already counted;
-			// RevertActor resumes where it stopped.
-			if _, err := r.control.RevertActor(ctx, &ateapipb.RevertActorRequest{Actor: goldenActorRef}); err != nil {
-				return 0, fmt.Errorf("while reverting crashed golden actor: %w", err)
-			}
-
 		case ateapipb.ActorState_ACTOR_STATE_DELETING:
 			// Nothing in the golden flow deletes the actor before the snapshot
 			// is taken; someone else interfered.
